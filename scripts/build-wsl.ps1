@@ -74,35 +74,90 @@ $image = "pocket-native-build:$hash"
 
 # wslc's CLI intentionally follows familiar container CLI syntax. Try an
 # inspect first; if the image is absent, build it from Pocket Native's file.
-& wslc.exe image inspect $image *> $null
-if ($LASTEXITCODE -ne 0) {
+# Windows PowerShell can promote native stderr to NativeCommandError while
+# $ErrorActionPreference is Stop. A missing image is expected on the first run,
+# so probe it with Continue and decide from the native exit code.
+$oldErrorActionPreference = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+& wslc.exe image inspect $image 2>$null | Out-Null
+$imageInspectExitCode = $LASTEXITCODE
+$ErrorActionPreference = $oldErrorActionPreference
+
+if ($imageInspectExitCode -ne 0) {
     Write-Host "== making the WSL build container, once"
     & wslc.exe build -f $containerFile -t $image (Join-Path $repo "scripts\container")
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
+# Keep /work on the Windows filesystem while diagnosing WSLC. This is slower
+# than an internal Linux volume, but it survives a client/container failure and
+# lets us inspect/reuse generated C, object files and Cargo output.
+$workRoot = Join-Path $repo ".wsl-work"
+New-Item -ItemType Directory -Force -Path $workRoot | Out-Null
+$workRoot = (Resolve-Path -LiteralPath $workRoot).Path
+
 $failed = @()
 foreach ($file in $Rom) {
-    Write-Host "== building $(Split-Path -Leaf $file)"
+    $leaf = Split-Path -Leaf $file
+    Write-Host "== building $leaf"
+
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $safeLeaf = [IO.Path]::GetFileNameWithoutExtension($leaf) -replace '[^A-Za-z0-9_.-]', '-'
+    if ($safeLeaf.Length -gt 40) { $safeLeaf = $safeLeaf.Substring(0, 40) }
+    $containerName = "pocket-native-$stamp-$safeLeaf"
+    $logFile = Join-Path $workRoot "$containerName.log"
+
     $mounts = @(
         "-v", "${repo}:/src:ro",
-        "-v", "pocket-native-work:/work",
+        "-v", "${workRoot}:/work",
         "-v", "${Out}:/out",
         "-v", "$(Split-Path -Parent $file):/rom:ro"
     )
-    $arguments = @("/rom/$(Split-Path -Leaf $file)")
+    $arguments = @("/rom/$leaf")
     $gameKeys = KeysFor $file
     if ($gameKeys) {
         $mounts += @("-v", "$(Split-Path -Parent $gameKeys):/keys:ro")
         $arguments += "/keys/$(Split-Path -Leaf $gameKeys)"
     }
 
-    & wslc.exe run --rm @mounts `
+    Write-Host "== diagnostic container: $containerName"
+    Write-Host "== persistent work dir: $workRoot"
+    Write-Host "== log: $logFile"
+
+    # Deliberately DO NOT use --rm. If WSLC wedges after the workload exits,
+    # the container and /work remain available for inspection/recovery.
+    # Tee-Object also leaves a persistent transcript of the build.
+    # Cargo and other Unix tools legitimately write progress to stderr.
+    # Windows PowerShell 5.1 can promote that native stderr to a terminating
+    # NativeCommandError when ErrorActionPreference is Stop, even on success.
+    # Temporarily allow native stderr, while still checking wslc's real exit code.
+    $oldErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & wslc.exe run --name $containerName @mounts `
         -e CARGO_HOME=/work/cargo `
         -e CARGO_TARGET_DIR=/work/target `
         -e HOME=/work `
-        $image bash /src/scripts/container/inside.sh @arguments
-    if ($LASTEXITCODE -ne 0) { $failed += $file }
+        $image bash /src/scripts/container/inside.sh @arguments 2>&1 |
+        Tee-Object -FilePath $logFile
+    $runExitCode = $LASTEXITCODE
+    $ErrorActionPreference = $oldErrorActionPreference
+    if ($runExitCode -ne 0) {
+        Write-Host "== build command returned exit code $runExitCode"
+        Write-Host "== keeping container '$containerName' and work directory for diagnosis"
+        $failed += $file
+        continue
+    }
+
+    $expectedOutput = Join-Path $Out "Pocket Native"
+    if (-not (Test-Path -LiteralPath $expectedOutput)) {
+        Write-Host "== build command ended but expected output was not found: $expectedOutput"
+        Write-Host "== keeping container '$containerName' and work directory for diagnosis"
+        $failed += $file
+        continue
+    }
+
+    Write-Host "== output confirmed; removing diagnostic container $containerName"
+    & wslc.exe rm $containerName | Out-Null
 }
 
 # Same harmless release check as Pocket Native's official Windows script.
